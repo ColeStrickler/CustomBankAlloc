@@ -1,8 +1,6 @@
-package freechips.rocketchip.tilelink
-
 // See LICENSE.SiFive for license details.
 
-package freechips.rocketchip.tilelink
+package freechips.rocketchip.tilelink.CustomBankAlloc
 
 import chisel3._
 import chisel3.util._
@@ -10,6 +8,7 @@ import chisel3.util._
 import org.chipsalliance.cde.config._
 import org.chipsalliance.diplomacy._
 import org.chipsalliance.diplomacy.lazymodule._
+import freechips.rocketchip.tilelink._
 
 import freechips.rocketchip.diplomacy.{AddressSet, TransferSizes}
 import freechips.rocketchip.util.DescribedSRAM
@@ -54,6 +53,7 @@ class CustomBankAlloc(params: CustomBankAllocParams)(implicit p: Parameters) ext
     val bankBits = log2Ceil(params.cacheBanks)
     val wayBits = log2Ceil(params.cacheWays)
     val nSets = params.cacheSize/(params.cacheWays*params.cacheBlockSize)
+    val blockBits = log2Ceil(params.cacheBlockSize)
     val bank_alloc_dir =  DescribedSRAM(
       name = "bankALlocDir",
       desc = "Bank Alloc Directory",
@@ -61,15 +61,17 @@ class CustomBankAlloc(params: CustomBankAllocParams)(implicit p: Parameters) ext
       data = Vec(params.cacheWays*params.cacheBanks, BankAllocEntry(tagBits, bankBits))
     )
 
+    val node = TLAdapterNode()
+    assert(node.out.length == params.cacheBanks, "node.out.length of " + node.out.length.toString() + "does not equal params.cacheBanks")
+    assert(node.in.length == 1, "node.in.length != 1") // i think we need this. Will greatly simplify things - if not need to rethink a bit
 
 
     // Extracts set bits from the tag
-    def Tag2Set(addr: UInt) : UInt = {
-        val blockBits = log2Ceil(params.cacheBlockSize)
+    def Tag2Set(tag: UInt) : UInt = {   
         val cacheSizeBits = log2Ceil(params.cacheSize)
         val setBits = cacheSizeBits - (blockBits + wayBits)
         val setMask = (math.pow(2, setBits) - 1).toInt.U
-        val set = (addr >> (blockBits+wayBits)) & setMask
+        val set = (tag >> (wayBits)) & setMask
         set
     }
 
@@ -79,6 +81,8 @@ class CustomBankAlloc(params: CustomBankAllocParams)(implicit p: Parameters) ext
         1. Instantiate a BankBinder node that uses the old policy for allocation
         2. Probably modify the OS to allow sharing/coherence? 
         3. Arbitrate outgoing edges to allow both policies to forward requests
+
+        Size of directory is (tag_size + bank_bits)(total_llc_cache_lines)(1byte/8bit)
     */
 
 
@@ -91,12 +95,16 @@ class CustomBankAlloc(params: CustomBankAllocParams)(implicit p: Parameters) ext
         val randomBankAlloc = RegInit(0.U(log2Ceil(params.cacheBanks).W))
 
         // we can use an LSFR for pseudo random way allocation
-        val lsfr = Module(new GaloisLFSR(4, Set(4,3)))
+        val lsfr = Module(new GaloisLFSR(log2Ceil(params.cacheWays), Set(log2Ceil(params.cacheWays),log2Ceil(params.cacheWays)-1)))
         lsfr.io.increment := true.B
-        val allocWayPRNG = lsfr.io.out.asUInt
-        assert(lsfr.io.out.asUInt >= 0.U && lsfr.io.out.asUInt <= params.cacheWays.U, "lsfr output a number out of range: " + lsfr.io.out.asUInt.toString())
+        val allocWayPRNG = lsfr.io.out.asUInt(log2Ceil(params.cacheWays)-1, 0) // only take what we need
+        assert(allocWayPRNG >= 0.U && allocWayPRNG <= params.cacheWays.U, "lsfr output a number out of range: " + allocWayPRNG.toString())
 
         // i think we can leave return edges the same
+
+        val (in, in_edge) = node.in(0)
+        
+
 
 
 
@@ -108,15 +116,30 @@ class CustomBankAlloc(params: CustomBankAllocParams)(implicit p: Parameters) ext
         4. if entry is found in directory -> send request to that bank
         5. if entry is found in eviction fifo -> we can allocate it on a new bank and send to that bank
         6. if entry not found -> we need to allocate a new entry and then send to bank we allocate from
+
+
+        We must not accept incoming request when performing eviction
+
+
       */
-      val incoming_tag = 0.U // get from incoming edges
-      val incoming_set = 0.U // actually calculate
-      val readWayEntries = bank_alloc_dir.read(incoming_set, true.B)
+
+      val incoming_address = Mux(in.a.fire, in.a.bits.address, Mux(in.c.fire, in.c.bits.address, 0.U))
+      val incoming_tag =  (incoming_address >> (blockBits.U))(in.a.bits.address.getWidth-1-blockBits, 0) // get from incoming edges
+      val incoming_set = Tag2Set(incoming_tag)
+      val readWayEntries = bank_alloc_dir.read(incoming_set, in.c.fire || in.a.fire)
 
       val incoming_tag_matches = readWayEntries.map(_.tag === incoming_tag) 
       val incoming_tag_hit = incoming_tag_matches.reduce(_ || _) // will be high if any hit
       val incoming_hit_index = Mux1H(incoming_tag_matches, VecInit((0 until params.cacheWays*params.cacheBanks).map(_.U))) // get index of the hit
       val incoming_hit_entry = readWayEntries(incoming_hit_index)
+      val bankOut = incoming_hit_entry.bank
+
+
+
+
+
+
+
 
       /*
         For eviction:
