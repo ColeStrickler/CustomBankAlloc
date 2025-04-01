@@ -15,6 +15,7 @@ import freechips.rocketchip.diplomacy.{AddressSet, TransferSizes}
 import freechips.rocketchip.util.DescribedSRAM
 import _root_.freechips.rocketchip.util.DescribedSRAM
 import chisel3.util.random.GaloisLFSR
+import _root_.freechips.rocketchip.util.SeqToAugmentedSeq
 
 
 
@@ -60,6 +61,19 @@ class CustomBankAlloc(params: CustomBankAllocParams)(implicit p: Parameters) ext
       data = Vec(params.cacheWays*params.cacheBanks, BankAllocEntry(tagBits, bankBits))
     )
 
+
+
+    // Extracts set bits from the tag
+    def Tag2Set(addr: UInt) : UInt = {
+        val blockBits = log2Ceil(params.cacheBlockSize)
+        val cacheSizeBits = log2Ceil(params.cacheSize)
+        val setBits = cacheSizeBits - (blockBits + wayBits)
+        val setMask = (math.pow(2, setBits) - 1).toInt.U
+        val set = (addr >> (blockBits+wayBits)) & setMask
+        set
+    }
+
+
     /*
         If we split the bank allocation policy we need to do the following:
         1. Instantiate a BankBinder node that uses the old policy for allocation
@@ -78,7 +92,9 @@ class CustomBankAlloc(params: CustomBankAllocParams)(implicit p: Parameters) ext
 
         // we can use an LSFR for pseudo random way allocation
         val lsfr = Module(new GaloisLFSR(4, Set(4,3)))
-
+        lsfr.io.increment := true.B
+        val allocWayPRNG = lsfr.io.out.asUInt
+        assert(lsfr.io.out.asUInt >= 0.U && lsfr.io.out.asUInt <= params.cacheWays.U, "lsfr output a number out of range: " + lsfr.io.out.asUInt.toString())
 
         // i think we can leave return edges the same
 
